@@ -1,0 +1,80 @@
+#!/bin/bash
+set -e
+
+echo "== Update & install prerequisites =="
+apt-get update -y
+apt-get install -y ca-certificates curl gnupg lsb-release iptables-persistent
+
+echo "== Install Docker (Ubuntu) =="
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+chmod a+r /etc/apt/keyrings/docker.gpg
+
+UBU_CODENAME="$(. /etc/os-release && echo ${VERSION_CODENAME})"
+
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+  https://download.docker.com/linux/ubuntu ${UBU_CODENAME} stable" \
+  > /etc/apt/sources.list.d/docker.list
+
+apt-get update -y
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+systemctl enable --now docker
+
+echo "== Enable IP forwarding =="
+cat >/etc/sysctl.d/99-openvpn.conf <<EOF
+net.ipv4.ip_forward=1
+EOF
+sysctl --system
+
+echo "== Prepare OpenVPN config directory =="
+mkdir -p /etc/openvpn
+
+echo "== Add NAT masquerade for VPN subnet (10.8.0.0/24) =="
+IFACE="ens4"
+iptables -t nat -C POSTROUTING -s 10.8.0.0/24 -o ${IFACE} -j MASQUERADE 2>/dev/null || \
+iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o ${IFACE} -j MASQUERADE
+
+netfilter-persistent save
+
+echo "== Pull OpenVPN image =="
+docker pull ${openvpn_image}
+
+cat >/root/OPENVPN_DOCKER_README.txt <<'EOF'
+Next steps (run manually):
+
+1) Get this VM external IP:
+   curl -s ifconfig.me
+
+2) Generate server config (UDP 1194) + VPN subnet 10.8.0.0/24:
+   docker run --rm -v /etc/openvpn:/etc/openvpn kylemanna/openvpn \
+     ovpn_genconfig -u udp://<EXTERNAL_IP> -s 10.8.0.0/24
+
+   (Optional) push route to VPC subnet:
+   docker run --rm -v /etc/openvpn:/etc/openvpn kylemanna/openvpn \
+     /bin/bash -c "echo 'push \"route 10.10.0.0 255.255.255.0\"' >> /etc/openvpn/openvpn.conf"
+
+3) Initialize PKI:
+   docker run --rm -it -v /etc/openvpn:/etc/openvpn kylemanna/openvpn ovpn_initpki
+
+4) Run OpenVPN server:
+   docker run -d --name openvpn --restart=always \
+     --cap-add=NET_ADMIN \
+     -p 1194:1194/udp \
+     -v /etc/openvpn:/etc/openvpn \
+     kylemanna/openvpn
+
+5) Create a client:
+   docker run --rm -it -v /etc/openvpn:/etc/openvpn kylemanna/openvpn \
+     easyrsa build-client-full user1 nopass
+
+6) Export client config:
+   docker run --rm -v /etc/openvpn:/etc/openvpn kylemanna/openvpn \
+     ovpn_getclient user1 > /root/user1.ovpn
+
+7) Copy .ovpn to your local machine via scp:
+   scp <user>@<EXTERNAL_IP>:/root/user1.ovpn .
+
+EOF
+
+echo "== Done. See /root/OPENVPN_DOCKER_README.txt =="
