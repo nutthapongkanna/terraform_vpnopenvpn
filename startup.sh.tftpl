@@ -1,24 +1,30 @@
 #!/bin/bash
 set -e
 
+export DEBIAN_FRONTEND=noninteractive
+
 echo "== Update & install prerequisites =="
 apt-get update -y
-apt-get install -y ca-certificates curl gnupg lsb-release iptables-persistent
+apt-get install -y ca-certificates curl gnupg lsb-release
 
 echo "== Install Docker (Ubuntu) =="
+
 install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
 chmod a+r /etc/apt/keyrings/docker.gpg
 
-UBU_CODENAME="$(. /etc/os-release && echo ${VERSION_CODENAME})"
+UBU_CODENAME="$(. /etc/os-release && echo $VERSION_CODENAME)"
 
 echo \
   "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-  https://download.docker.com/linux/ubuntu ${UBU_CODENAME} stable" \
+  https://download.docker.com/linux/ubuntu $UBU_CODENAME stable" \
   > /etc/apt/sources.list.d/docker.list
 
 apt-get update -y
 apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
 systemctl enable --now docker
 
 echo "== Enable IP forwarding =="
@@ -30,51 +36,82 @@ sysctl --system
 echo "== Prepare OpenVPN config directory =="
 mkdir -p /etc/openvpn
 
-echo "== Add NAT masquerade for VPN subnet (10.8.0.0/24) =="
-IFACE="ens4"
-iptables -t nat -C POSTROUTING -s 10.8.0.0/24 -o ${IFACE} -j MASQUERADE 2>/dev/null || \
-iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o ${IFACE} -j MASQUERADE
+echo "== Add NAT masquerade for VPN subnet 10.8.0.0/24 =="
 
-netfilter-persistent save
+IFACE="ens4"
+iptables -t nat -C POSTROUTING -s 10.8.0.0/24 -o $IFACE -j MASQUERADE 2>/dev/null || \
+iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o $IFACE -j MASQUERADE
 
 echo "== Pull OpenVPN image =="
 docker pull ${openvpn_image}
 
-cat >/root/OPENVPN_DOCKER_README.txt <<'EOF'
-Next steps (run manually):
+echo "== Detect external IP (metadata) =="
+EXTERNAL_IP="$(curl -s -H "Metadata-Flavor: Google" \
+  http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip)"
 
-1) Get this VM external IP:
-   curl -s ifconfig.me
+echo "External IP: $EXTERNAL_IP"
 
-2) Generate server config (UDP 1194) + VPN subnet 10.8.0.0/24:
-   docker run --rm -v /etc/openvpn:/etc/openvpn kylemanna/openvpn \
-     ovpn_genconfig -u udp://<EXTERNAL_IP> -s 10.8.0.0/24
+echo "== Generate OpenVPN server config if not exists =="
+if [ ! -f /etc/openvpn/openvpn.conf ]; then
+  docker run --rm -v /etc/openvpn:/etc/openvpn ${openvpn_image} \
+    ovpn_genconfig -u udp://$EXTERNAL_IP -s 10.8.0.0/24
 
-   (Optional) push route to VPC subnet:
-   docker run --rm -v /etc/openvpn:/etc/openvpn kylemanna/openvpn \
-     /bin/bash -c "echo 'push \"route 10.10.0.0 255.255.255.0\"' >> /etc/openvpn/openvpn.conf"
+  docker run --rm -v /etc/openvpn:/etc/openvpn ${openvpn_image} \
+    /bin/bash -c "echo 'push \"route 10.10.0.0 255.255.255.0\"' >> /etc/openvpn/openvpn.conf"
+fi
 
-3) Initialize PKI:
-   docker run --rm -it -v /etc/openvpn:/etc/openvpn kylemanna/openvpn ovpn_initpki
+echo "== Initialize PKI if not exists (LAB mode, no passphrase) =="
+if [ ! -d /etc/openvpn/pki ]; then
+  docker run --rm -v /etc/openvpn:/etc/openvpn \
+    -e EASYRSA_BATCH=1 \
+    ${openvpn_image} \
+    ovpn_initpki nopass
+fi
 
-4) Run OpenVPN server:
-   docker run -d --name openvpn --restart=always \
-     --cap-add=NET_ADMIN \
-     -p 1194:1194/udp \
-     -v /etc/openvpn:/etc/openvpn \
-     kylemanna/openvpn
+echo "== Run OpenVPN server container =="
+if ! docker ps -a --format '{{.Names}}' | grep -q '^openvpn$'; then
+  docker run -d --name openvpn --restart=always \
+    --cap-add=NET_ADMIN \
+    -p 1194:1194/udp \
+    -v /etc/openvpn:/etc/openvpn \
+    ${openvpn_image}
+else
+  docker start openvpn || true
+fi
 
-5) Create a client:
-   docker run --rm -it -v /etc/openvpn:/etc/openvpn kylemanna/openvpn \
-     easyrsa build-client-full user1 nopass
+echo "== Create default client user1 if not exists =="
+if [ ! -f /etc/openvpn/pki/issued/user1.crt ]; then
+  docker run --rm -v /etc/openvpn:/etc/openvpn \
+    -e EASYRSA_BATCH=1 \
+    ${openvpn_image} \
+    easyrsa build-client-full user1 nopass
+fi
 
-6) Export client config:
-   docker run --rm -v /etc/openvpn:/etc/openvpn kylemanna/openvpn \
-     ovpn_getclient user1 > /root/user1.ovpn
+echo "== Export client config to /root/user1.ovpn =="
+if [ ! -f /root/user1.ovpn ]; then
+  docker run --rm -v /etc/openvpn:/etc/openvpn \
+    ${openvpn_image} \
+    ovpn_getclient user1 > /root/user1.ovpn
 
-7) Copy .ovpn to your local machine via scp:
-   scp <user>@<EXTERNAL_IP>:/root/user1.ovpn .
+  chmod 600 /root/user1.ovpn
+fi
 
+cat >/root/OPENVPN_STATUS.txt <<EOF
+OpenVPN lab auto-setup complete.
+
+Server:
+- UDP 1194
+- VPN subnet: 10.8.0.0/24
+- Push route: 10.10.0.0/24
+
+Client created:
+- user1
+
+Client config file:
+- /root/user1.ovpn
+
+If you need to regenerate:
+  docker run --rm -v /etc/openvpn:/etc/openvpn ${openvpn_image} ovpn_getclient user1 > /root/user1.ovpn
 EOF
 
-echo "== Done. See /root/OPENVPN_DOCKER_README.txt =="
+echo "== Done. See /root/OPENVPN_STATUS.txt and /root/user1.ovpn =="
