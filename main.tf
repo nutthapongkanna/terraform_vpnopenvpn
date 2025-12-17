@@ -1,19 +1,3 @@
-terraform {
-  required_version = ">= 1.5.0"
-  required_providers {
-    google = {
-      source  = "hashicorp/google"
-      version = ">= 5.0"
-    }
-  }
-}
-
-provider "google" {
-  project = var.project_id
-  region  = var.region
-  zone    = var.zone
-}
-
 # -----------------------
 # Network
 # -----------------------
@@ -32,8 +16,6 @@ resource "google_compute_subnetwork" "subnet_main" {
 # -----------------------
 # Firewall
 # -----------------------
-
-# Allow OpenVPN UDP 1194 from Internet
 resource "google_compute_firewall" "allow_openvpn" {
   name    = "fw-openvpn-udp-1194"
   network = google_compute_network.vpc_main.name
@@ -50,7 +32,6 @@ resource "google_compute_firewall" "allow_openvpn" {
   target_tags   = ["vpn-server"]
 }
 
-# Allow SSH to VPN VM (lock down!)
 resource "google_compute_firewall" "allow_ssh_vpn" {
   name    = "fw-vpn-ssh"
   network = google_compute_network.vpc_main.name
@@ -67,8 +48,6 @@ resource "google_compute_firewall" "allow_ssh_vpn" {
   target_tags   = ["vpn-server"]
 }
 
-# Allow VPN clients (10.8.0.0/24) to reach tagged VMs in VPC
-# so you can ping/ssh them after connecting VPN.
 resource "google_compute_firewall" "allow_from_vpn_clients" {
   name    = "fw-allow-from-vpn-clients"
   network = google_compute_network.vpc_main.name
@@ -76,9 +55,7 @@ resource "google_compute_firewall" "allow_from_vpn_clients" {
   direction = "INGRESS"
   priority  = 1000
 
-  allow {
-    protocol = "icmp"
-  }
+  allow { protocol = "icmp" }
 
   allow {
     protocol = "tcp"
@@ -89,7 +66,6 @@ resource "google_compute_firewall" "allow_from_vpn_clients" {
   target_tags   = ["vpn-client-target"]
 }
 
-# (Optional) Allow internal within subnet (helpful for labs)
 resource "google_compute_firewall" "allow_internal" {
   name    = "fw-allow-internal-10-10"
   network = google_compute_network.vpc_main.name
@@ -97,9 +73,7 @@ resource "google_compute_firewall" "allow_internal" {
   direction = "INGRESS"
   priority  = 1000
 
-  allow {
-    protocol = "icmp"
-  }
+  allow { protocol = "icmp" }
 
   allow {
     protocol = "tcp"
@@ -134,11 +108,9 @@ resource "google_compute_instance" "vpn_1" {
   network_interface {
     network    = google_compute_network.vpc_main.id
     subnetwork = google_compute_subnetwork.subnet_main.id
-
-    access_config {} # external IP
+    access_config {}
   }
 
-  # Required for VPN routing
   can_ip_forward = true
 
   metadata_startup_script = templatefile("${path.module}/startup.sh.tftpl", {
@@ -149,26 +121,3 @@ resource "google_compute_instance" "vpn_1" {
     scopes = ["https://www.googleapis.com/auth/cloud-platform"]
   }
 }
-
-# -----------------------
-# OPTIONAL: Target VM for testing
-# Uncomment if you want an internal VM to test ping/ssh via VPN.
-# -----------------------
-# resource "google_compute_instance" "test_vm" {
-#   name         = "test-vm"
-#   machine_type = "e2-micro"
-#   zone         = var.zone
-#   tags         = ["vpn-client-target"]
-#
-#   boot_disk {
-#     initialize_params {
-#       image = "debian-cloud/debian-12"
-#       size  = 10
-#     }
-#   }
-#
-#   network_interface {
-#     network    = google_compute_network.vpc_main.id
-#     subnetwork = google_compute_subnetwork.subnet_main.id
-#   }
-# }
